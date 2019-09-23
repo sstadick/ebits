@@ -1,10 +1,11 @@
+use croaring::Bitmap;
 use std::cmp::Ordering::{self};
 use std::collections::HashSet;
 
 /// Represent a range from [start, stop)
 /// Inclusive start, exclusive of stop
 #[derive(Eq, Debug, Clone)]
-pub struct Interval<T: Eq + Clone> {
+pub struct Interval<T: Eq + Clone + std::fmt::Debug> {
     pub start: u32,
     pub stop: u32,
     pub val: T,
@@ -13,18 +14,20 @@ pub struct Interval<T: Eq + Clone> {
 /// Primary object of the library. The public intervals holds all the intervals and can be used for
 /// iterating / pulling values out of the tree.
 #[derive(Debug)]
-pub struct Ebits<T: Eq + Clone> {
+pub struct Ebits<T: Eq + Clone + std::fmt::Debug> {
     /// List of intervasl
     pub intervals: Vec<Interval<T>>,
     /// Sorted list of start positions,
     starts: Vec<u32>,
     start_pointers: Vec<usize>,
+    start_bitmaps: Vec<Bitmap>,
     /// Sorted list of end positions,
     stops: Vec<u32>,
     stop_pointers: Vec<usize>,
+    stop_bitmaps: Vec<Bitmap>,
 }
 
-impl<T: Eq + Clone> Interval<T> {
+impl<T: Eq + Clone + std::fmt::Debug> Interval<T> {
     /// Compute the intsect between two intervals
     #[inline]
     pub fn intersect(&self, other: &Interval<T>) -> u32 {
@@ -40,7 +43,7 @@ impl<T: Eq + Clone> Interval<T> {
     }
 }
 
-impl<T: Eq + Clone> Ord for Interval<T> {
+impl<T: Eq + Clone + std::fmt::Debug> Ord for Interval<T> {
     #[inline]
     fn cmp(&self, other: &Interval<T>) -> Ordering {
         if self.start < other.start {
@@ -53,21 +56,21 @@ impl<T: Eq + Clone> Ord for Interval<T> {
     }
 }
 
-impl<T: Eq + Clone> PartialOrd for Interval<T> {
+impl<T: Eq + Clone + std::fmt::Debug> PartialOrd for Interval<T> {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(&other))
     }
 }
 
-impl<T: Eq + Clone> PartialEq for Interval<T> {
+impl<T: Eq + Clone + std::fmt::Debug> PartialEq for Interval<T> {
     #[inline]
     fn eq(&self, other: &Interval<T>) -> bool {
         self.start == other.start && self.stop == other.stop
     }
 }
 
-impl<T: Eq + Clone> Ebits<T> {
+impl<T: Eq + Clone + std::fmt::Debug> Ebits<T> {
     /// Create a new instance of Lapper by passing in a vector of Intervals. This vector will
     /// immediately be sorted by start order.
     /// ```
@@ -75,7 +78,7 @@ impl<T: Eq + Clone> Ebits<T> {
     /// let data = (0..20).step_by(5)
     ///                   .map(|x| Interval{start: x, stop: x + 10, val: true})
     ///                   .collect::<Vec<Interval<bool>>>();
-    /// let lapper = Ebit::new(data);
+    /// let lapper = Ebits::new(data);
     /// ```
     pub fn new(mut intervals: Vec<Interval<T>>) -> Self {
         intervals.sort();
@@ -88,14 +91,35 @@ impl<T: Eq + Clone> Ebits<T> {
         starts_pointers.sort_by(|a, b| a.0.cmp(&b.0));
         stops_pointers.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let (starts, start_pointers) = starts_pointers.into_iter().unzip();
-        let (stops, stop_pointers) = stops_pointers.into_iter().unzip();
+        let (starts, start_pointers): (Vec<u32>, Vec<usize>) = starts_pointers.into_iter().unzip();
+        let (stops, stop_pointers): (Vec<u32>, Vec<usize>) = stops_pointers.into_iter().unzip();
+        let (mut start_bitmaps, stop_bitmaps): (Vec<_>, Vec<_>) = (0..intervals.len())
+            .map(|x| {
+                let mut start = Bitmap::create_with_capacity(x as u32);
+                let start_slice: Vec<u32> = start_pointers[..x].iter().map(|&x| x as u32).collect();
+                start.add_many(&start_slice);
+                start.run_optimize();
+                let mut stop = Bitmap::create_with_capacity(intervals.len() as u32 - x as u32);
+                let stop_slice: Vec<u32> = stop_pointers[x..].iter().map(|&x| x as u32).collect();
+                stop.add_many(&stop_slice);
+                stop.run_optimize();
+                (start, stop)
+            })
+            .unzip();
+        // Add the last bitmap that contains all
+        let mut start = Bitmap::create_with_capacity(intervals.len() as u32);
+        let start_slice: Vec<u32> = start_pointers.iter().map(|&x| x as u32).collect();
+        start.add_many(&start_slice);
+        start.run_optimize();
+        start_bitmaps.push(start);
         Ebits {
             intervals,
             starts,
             stops,
             start_pointers,
             stop_pointers,
+            start_bitmaps,
+            stop_bitmaps,
         }
     }
 
@@ -141,36 +165,63 @@ impl<T: Eq + Clone> Ebits<T> {
         result
     }
 
+    // The idea here is as follows:
+    // Search for the start position in the stops. The index is the breakpoint. Before the index
+    // are stops too low to intersect, above it are stops that might work.
+    // Search for the stop postion in the starts. The index is the breakpoint. Before the index are
+    // possible starts, after the index are impossible starts.
+    // Lookup the index's that the possible start/stop postions pair with, and take the
+    // intersection of those index's
     #[inline]
     pub fn find(&self, start: u32, stop: u32) -> IterFind<T> {
         let len = self.intervals.len();
         let mut first = Self::bsearch_seq(start, &self.stops);
-        let mut last = Self::bsearch_seq(stop, &self.starts);
-        //println!("{}/{}", start, stop);
-        //println!("pre start found in stops: {}: {}", first, self.stops[first]);
-        //println!("pre stop found in starts: {}", last);
-        //while last < len && self.starts[last] == stop {
-        //last += 1;
-        //}
+        let last = Self::bsearch_seq(stop, &self.starts);
         while first < len && self.stops[first] == start {
             first += 1;
         }
-        let start_pointers: HashSet<usize> = self.start_pointers[first..].iter().cloned().collect();
-        let stop_pointers: HashSet<usize> = self.stop_pointers[first..].iter().cloned().collect();
+        //println!("start, stop: {}/{}", start, stop);
+        //println!("first, last: {}/{}", first, last);
+        //println!("{:#?}", start_bitmap.to_vec());
+        //println!("{:#?}", stop_bitmap.to_vec());
+        let results = if first == self.intervals.len() && last == self.intervals.len() {
+            vec![]
+        } else if last == self.intervals.len() {
+            let stop_bitmap = &self.stop_bitmaps[first];
+            stop_bitmap.to_vec()
+        } else if first == self.intervals.len() {
+            let start_bitmap = &self.start_bitmaps[last];
+            start_bitmap.to_vec()
+        } else {
+            let stop_bitmap = &self.stop_bitmaps[first];
+            let start_bitmap = &self.start_bitmaps[last];
+            let result = start_bitmap.and(&stop_bitmap);
+            result.to_vec()
+        };
+        //println!("{:#?}", results);
+        // TODO: Need to find a way to limit the size of stop pointers, becasue they are huge
+        //let mut start_pointers =
+        //Bitmap::create_with_capacity(self.start_pointers.len() as u32 - last as u32);
+        //let starts: Vec<_> = self.start_pointers[..last]
+        //.iter()
+        //.map(|x| *x as u32)
+        //.collect();
+        //start_pointers.add_many(&starts);
+        //let results: Vec<_> = self.stop_pointers[first..]
+        //.iter()
+        //.filter_map(|&x| {
+        //if start_pointers.contains(x as u32) {
+        //Some(x)
+        //} else {
+        //None
+        //}
+        //})
+        //.collect();
 
-        let mut all_pointers: Vec<&usize> = start_pointers.intersection(&stop_pointers).collect();
-
-        all_pointers.dedup();
-        let result = all_pointers.iter().map(|x| &self.intervals[**x]).collect();
-        //let num_cant_after = len - last;
-        //let result = len - first - num_cant_after;
-        //println!("{:#?}", self.starts);
-        //println!("{:#?}", self.stops);
-        //println!("start found in stops: {}", first);
-        //println!("stop found in starts: {}", last);
         IterFind {
-            results: result,
+            results,
             curr: 0,
+            inner: self,
         }
     }
 }
@@ -178,13 +229,14 @@ impl<T: Eq + Clone> Ebits<T> {
 #[derive(Debug)]
 pub struct IterFind<'a, T>
 where
-    T: Eq + Clone + 'a,
+    T: Eq + Clone + std::fmt::Debug + 'a,
 {
-    results: Vec<&'a Interval<T>>,
+    results: Vec<u32>,
     curr: usize,
+    inner: &'a Ebits<T>,
 }
 
-impl<'a, T: Eq + Clone> Iterator for IterFind<'a, T> {
+impl<'a, T: Eq + Clone + std::fmt::Debug> Iterator for IterFind<'a, T> {
     type Item = &'a Interval<T>;
 
     #[inline]
@@ -192,7 +244,7 @@ impl<'a, T: Eq + Clone> Iterator for IterFind<'a, T> {
     fn next(&mut self) -> Option<Self::Item> {
         if self.curr < self.results.len() {
             self.curr += 1;
-            Some(self.results[self.curr - 1])
+            Some(&self.inner.intervals[self.results[self.curr - 1] as usize])
         } else {
             None
         }
